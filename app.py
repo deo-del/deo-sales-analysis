@@ -282,6 +282,7 @@ def build_model(order_raw, inv_raw, client_raw, remove_dups):
     so["CLIENT_KEY"] = key
     so = so.merge(client.rename(columns={"PARTY_KEY": "CLIENT_KEY"}), on="CLIENT_KEY", how="left")
     so["MAPPED"] = so["CLIENT_KEY"].notna()
+    so["CL_PARTY_NAME"] = so["CL_PARTY_NAME"].fillna(so["PARTY_NAME"])
     for name in CLIENT_ATTRS:
         so[name] = so[name].replace("", np.nan).fillna("NOT SET")
     so["PARTY_GROUP"] = np.where(so["MAPPED"], so["PARTY_GROUP"].replace("NOT SET", np.nan).fillna(so["PARTY_NAME"]),
@@ -308,7 +309,7 @@ def build_model(order_raw, inv_raw, client_raw, remove_dups):
         fact[c] = fact[c].fillna(0)
     fact["DISCONTINUED"] = fact["DISCONTINUED"].fillna(False).astype(bool)
     fact["PARTIAL_STATUS"] = fact["PARTIAL_STATUS"].fillna("")
-    fact = fact.merge(so.drop(columns=["PARTY_KEY", "GSTNO", "CLIENT_KEY", "CL_PARTY_NAME", "CL_GSTNO"]),
+    fact = fact.merge(so.drop(columns=["PARTY_KEY", "GSTNO", "CLIENT_KEY", "CL_GSTNO"]),
                       on="SODOCNO", how="left")
 
     fact["SHORT_QTY"] = (fact["ORDER_QTY"] - fact["INV_QTY"]).clip(lower=0)
@@ -330,7 +331,7 @@ def build_model(order_raw, inv_raw, client_raw, remove_dups):
           "bad_sodate": int(orders["SODATE"].isna().sum()), "bad_billdate": int(inv["BILL_DATE"].isna().sum()),
           "multi_party_so": so[so["N_PARTIES"] > 1][["SODOCNO", "PARTY_NAME", "N_PARTIES"]],
           "client_rows": len(client)}
-    return fact, inv_linked, so, dq
+    return fact, inv_linked, so, dq, client
 
 
 # =============================================================================
@@ -505,7 +506,7 @@ try:
             st.stop()
         order_raw, inv_raw, client_raw = read_upload(fo), read_upload(fi), read_upload(fc)
 
-    fact, inv_all, so_all, dq = build_model(order_raw, inv_raw, client_raw, remove_dups)
+    fact, inv_all, so_all, dq, client_df = build_model(order_raw, inv_raw, client_raw, remove_dups)
 except ValueError as e:
     st.error(f"A sheet is missing a column this report needs. {e}")
     st.stop()
@@ -525,7 +526,25 @@ with st.sidebar:
     month_map = fact.drop_duplicates("MONTH").sort_values("MONTH").set_index("MONTH")["MONTH_NAME"]
     f_month = st.multiselect("Month (from SO date)", list(month_map.index), format_func=lambda m: month_map[m])
     filters = {"MONTH": f_month}
-    for col, label in [("PARTY_GROUP", "Party group"), ("PARTY_NAME", "Party"), ("ZONE", "Zone"), ("STATE", "State"),
+
+    # Party group (Client master col "Party Group") -> Party (Client master col "Party Name")
+    cm = client_df.assign(PARTY_GROUP=client_df["PARTY_GROUP"].replace("", np.nan).fillna(client_df["CL_PARTY_NAME"]))
+    group_opts = sorted(cm["PARTY_GROUP"].unique())
+    if (fact["PARTY_GROUP"] == "UNMAPPED PARTY").any():
+        group_opts.append("UNMAPPED PARTY")
+    f_group = st.multiselect("Party group", group_opts)
+    if f_group:
+        party_opts = sorted(cm.loc[cm["PARTY_GROUP"].isin(f_group), "CL_PARTY_NAME"].unique())
+        if "UNMAPPED PARTY" in f_group:
+            party_opts += sorted(fact.loc[fact["PARTY_GROUP"] == "UNMAPPED PARTY", "CL_PARTY_NAME"].unique())
+    else:
+        party_opts = sorted(cm["CL_PARTY_NAME"].unique())
+    f_party = st.multiselect("Party", party_opts,
+                             help="Shows only the parties of the selected party group(s), from Client master.")
+    filters["PARTY_GROUP"] = f_group
+    filters["CL_PARTY_NAME"] = f_party
+
+    for col, label in [("ZONE", "Zone"), ("STATE", "State"),
                        ("SALESMAN", "Salesman"), ("PLATFORM", "Platform"), ("TYPE", "Type")]:
         filters[col] = st.multiselect(label, sorted(fact[col].dropna().unique()))
     excl_disc = st.toggle("Exclude discontinued items", value=False,
@@ -786,15 +805,13 @@ with tabs[6]:
         bills = inv_f.groupby("BILL_NO").agg(
             BILL_DATE=("BILL_DATE", "min"), PARTY_NAME=("PARTY_NAME", "first"), PARTY_GROUP=("PARTY_GROUP", "first"),
             TRANSPORT=("TRANSPORT", "first"), DELIVERY=("DELIVERY", "first"), SOs=("SODOCNO", "nunique"),
-            Lines=("ITEM_NAME", "size"), Qty=("INV_QTY", "sum"), **{"Invoice Amount": ("INV_AMT", "sum")},
-            Packages=("PACKAGE", "sum"), **{"Gross Wt (kg)": ("GROSS_WT", "max")}).reset_index()
+            Lines=("ITEM_NAME", "size"), Qty=("INV_QTY", "sum"), **{"Invoice Amount": ("INV_AMT", "sum")}).reset_index()
         bills["Bill month"] = bills["BILL_DATE"].dt.strftime("%Y-%m")
         c = st.columns(4)
-        c[0].metric("Bills", f"{len(bills):,}")
-        c[1].metric("Packages", f"{bills['Packages'].sum():,.0f}")
-        c[2].metric("Gross weight", f"{bills['Gross Wt (kg)'].sum():,.0f} kg")
+        c[0].metric("Bills (unique BILL NO.)", f"{bills['BILL_NO'].nunique():,}")
+        c[1].metric("Sales orders billed (unique SODOCNO)", f"{inv_f['SODOCNO'].nunique():,}")
+        c[2].metric("Invoice amount", short_inr(bills["Invoice Amount"].sum()))
         c[3].metric("Avg bill value", short_inr(bills["Invoice Amount"].mean()))
-        st.caption("Gross weight is read once per bill (it repeats on every line of the same bill); packages are summed.")
 
         bm = bills.groupby("Bill month", as_index=False).agg(Bills=("BILL_NO", "count"),
                                                               **{"Invoice Amount": ("Invoice Amount", "sum")})
@@ -805,9 +822,7 @@ with tabs[6]:
         with c1:
             st.subheader("By transporter")
             tr = bills.groupby("TRANSPORT", as_index=False).agg(
-                Bills=("BILL_NO", "count"), Packages=("Packages", "sum"), **{"Gross Wt (kg)": ("Gross Wt (kg)", "sum"),
-                                                                            "Invoice Amount": ("Invoice Amount", "sum")})
-            tr["Value per kg"] = tr["Invoice Amount"] / tr["Gross Wt (kg)"].where(tr["Gross Wt (kg)"] > 0)
+                Bills=("BILL_NO", "count"), SOs=("SOs", "sum"), **{"Invoice Amount": ("Invoice Amount", "sum")})
             show_table(present(tr.sort_values("Invoice Amount", ascending=False)), "tr_tbl")
         with c2:
             st.subheader("By delivery location")
